@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-Time Chat with DMs</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Auth Screen Modal -->
+  <div id="auth-modal" class="auth-modal">
+    <div class="auth-box">
+      <h3 id="auth-title">Login</h3>
+      <p id="auth-error" class="error-msg"></p>
+      <input type="text" id="auth-username" placeholder="Username" autocomplete="off" />
+      <input type="password" id="auth-password" placeholder="Password" />
+      <div class="auth-buttons">
+        <button id="auth-submit-btn" type="button">Log In</button>
+        <button id="auth-toggle-btn" type="button" class="btn-secondary">Need an account? Register</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main App Layout -->
+  <div class="app-layout" id="app-layout" style="display: none;">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span id="display-username" class="user-badge"></span>
+        <button id="logout-btn" class="btn-logout">Logout</button>
+      </div>
+
+      <div class="section-title">CHANNELS</div>
+      <ul id="channel-list" class="nav-list">
+        <li class="active" data-room="general"># general</li>
+        <li data-room="random"># random</li>
+        <li data-room="tech"># tech</li>
+      </ul>
+
+      <div class="section-title">DIRECT MESSAGES</div>
+      <ul id="dm-list" class="nav-list"></ul>
+    </aside>
+
+    <!-- Chat Area -->
+    <main class="chat-container">
+      <header id="chat-header">
+        <h3 id="room-heading"># general</h3>
+      </header>
+
+      <ul id="messages"></ul>
+
+      <div id="typing-indicator" class="typing-indicator"></div>
+
+      <form id="chat-form">
+        <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" required />
+        <button type="submit">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    let socket = null;
+    let currentUser = null;
+    let currentRoom = 'general';
+    let isRegisterMode = false;
+
+    const authModal = document.getElementById('auth-modal');
+    const authTitle = document.getElementById('auth-title');
+    const authError = document.getElementById('auth-error');
+    const authUsername = document.getElementById('auth-username');
+    const authPassword = document.getElementById('auth-password');
+    const authSubmitBtn = document.getElementById('auth-submit-btn');
+    const authToggleBtn = document.getElementById('auth-toggle-btn');
+    const appLayout = document.getElementById('app-layout');
+    const displayUsername = document.getElementById('display-username');
+    const logoutBtn = document.getElementById('logout-btn');
+
+    const channelList = document.getElementById('channel-list');
+    const dmList = document.getElementById('dm-list');
+    const roomHeading = document.getElementById('room-heading');
+    const messages = document.getElementById('messages');
+    const typingIndicator = document.getElementById('typing-indicator');
+    const chatForm = document.getElementById('chat-form');
+    const messageInput = document.getElementById('message-input');
+
+    let isTyping = false;
+    let typingTimer = null;
+    const activeTypers = new Map();
+
+    // Helper to generate deterministic DM room names: "dm:alice:bob"
+    function getDmRoomName(user1, user2) {
+      return 'dm:' + [user1, user2].sort().join(':');
+    }
+
+    // Toggle Login / Register
+    authToggleBtn.addEventListener('click', () => {
+      isRegisterMode = !isRegisterMode;
+      authTitle.textContent = isRegisterMode ? 'Register' : 'Login';
+      authSubmitBtn.textContent = isRegisterMode ? 'Sign Up' : 'Log In';
+      authToggleBtn.textContent = isRegisterMode ? 'Have an account? Login' : 'Need an account? Register';
+      authError.textContent = '';
+    });
+
+    // Form submission for Login/Register
+    authSubmitBtn.addEventListener('click', async () => {
+      const username = authUsername.value.trim();
+      const password = authPassword.value;
+      if (!username || !password) return (authError.textContent = 'Please fill out all fields.');
+
+      const endpoint = isRegisterMode ? '/api/register' : '/api/login';
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (!res.ok) return (authError.textContent = data.error || 'Auth failed');
+
+        localStorage.setItem('chat_jwt', data.token);
+        localStorage.setItem('chat_user', data.username);
+        initChatSession(data.token, data.username);
+      } catch {
+        authError.textContent = 'Network error';
+      }
+    });
+
+    logoutBtn.addEventListener('click', () => {
+      localStorage.clear();
+      if (socket) socket.disconnect();
+      location.reload();
+    });
+
+    function initChatSession(token, username) {
+      currentUser = username;
+      authModal.style.display = 'none';
+      appLayout.style.display = 'flex';
+      displayUsername.textContent = `@${currentUser}`;
+
+      socket = io({ auth: { token } });
+
+      socket.on('connect_error', (err) => {
+        alert(err.message);
+        localStorage.clear();
+        location.reload();
+      });
+
+      setupSocketEvents();
+      loadUsersList();
+    }
+
+    async function loadUsersList() {
+      const res = await fetch('/api/users');
+      const users = await res.json();
+      renderDmList(users, []);
+    }
+
+    function renderDmList(allUsers, onlineUsernames) {
+      dmList.innerHTML = '';
+      allUsers.forEach((u) => {
+        if (u.username === currentUser) return; // Don't DM yourself
+
+        const li = document.createElement('li');
+        const roomName = getDmRoomName(currentUser, u.username);
+        li.dataset.room = roomName;
+        li.dataset.partner = u.username;
+
+        const isOnline = onlineUsernames.includes(u.username);
+        li.innerHTML = `<span class="status-dot ${isOnline ? 'online' : ''}"></span> @${escapeHtml(u.username)}`;
+
+        if (currentRoom === roomName) li.classList.add('active');
+
+        li.addEventListener('click', () => switchRoom(roomName, `@${u.username}`));
+        dmList.appendChild(li);
+      });
+    }
+
+    function switchRoom(roomName, label) {
+      if (currentRoom === roomName) return;
+
+      currentRoom = roomName;
+      roomHeading.textContent = label;
+      messages.innerHTML = '';
+      activeTypers.clear();
+      renderTypingText();
+
+      // Update active highlight in UI
+      document.querySelectorAll('.nav-list li').forEach((el) => {
+        el.classList.toggle('active', el.dataset.room === roomName);
+      });
+
+      socket.emit('room:join', currentRoom);
+    }
+
+    // Public Channel switching
+    channelList.querySelectorAll('li').forEach((item) => {
+      item.addEventListener('click', () => switchRoom(item.dataset.room, `# ${item.dataset.room}`));
+    });
+
+    function setupSocketEvents() {
+      // Update online status green dots
+      socket.on('users:online', (onlineUsernames) => {
+        document.querySelectorAll('#dm-list li').forEach((li) => {
+          const partner = li.dataset.partner;
+          const dot = li.querySelector('.status-dot');
+          if (dot) dot.classList.toggle('online', onlineUsernames.includes(partner));
+        });
+      });
+
+      // Typing debouncing
+      messageInput.addEventListener('input', () => {
+        if (!isTyping) {
+          isTyping = true;
+          socket.emit('typing:start', { room: currentRoom });
+        }
+        clearTimeout(typingTimer);
+        typingTimer = setTimeout(() => {
+          isTyping = false;
+          socket.emit('typing:stop', { room: currentRoom });
+        }, 1200);
+      });
+
+      chatForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const text = messageInput.value.trim();
+        if (text) {
+          clearTimeout(typingTimer);
+          isTyping = false;
+          socket.emit('typing:stop', { room: currentRoom });
+          socket.emit('chat:message', { text, room: currentRoom });
+          messageInput.value = '';
+        }
+      });
+
+      socket.on('chat:history', (historyList) => {
+        messages.innerHTML = '';
+        historyList.forEach((msg) => appendMessage(msg));
+      });
+
+      socket.on('chat:message', (data) => {
+        if (data.room === currentRoom) appendMessage(data);
+      });
+
+      socket.on('typing:start', (data) => {
+        activeTypers.set(data.id, data.user);
+        renderTypingText();
+      });
+
+      socket.on('typing:stop', (data) => {
+        activeTypers.delete(data.id);
+        renderTypingText();
+      });
+
+      socket.on('system:notification', (msg) => {
+        const li = document.createElement('li');
+        li.className = 'system-msg';
+        li.textContent = msg;
+        messages.appendChild(li);
+        messages.scrollTop = messages.scrollHeight;
+      });
+    }
+
+    function appendMessage(data) {
+      const li = document.createElement('li');
+      li.innerHTML = `<strong>${escapeHtml(data.user)}</strong> <span class="time">${data.timestamp}</span><p>${escapeHtml(data.text)}</p>`;
+      messages.appendChild(li);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function renderTypingText() {
+      const names = Array.from(activeTypers.values());
+      if (names.length === 0) typingIndicator.textContent = '';
+      else if (names.length === 1) typingIndicator.textContent = `${names[0]} is typing...`;
+      else typingIndicator.textContent = `${names.join(', ')} are typing...`;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // Auto-login if token exists
+    const savedToken = localStorage.getItem('chat_jwt');
+    const savedUser = localStorage.getItem('chat_user');
+    if (savedToken && savedUser) initChatSession(savedToken, savedUser);
+  </script>
+</body>
+</html>
